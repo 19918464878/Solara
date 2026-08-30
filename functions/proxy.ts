@@ -127,12 +127,21 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     return new Response("Missing types", { status: 400 });
   }
 
-  const upstream = await fetch(apiUrl.toString(), {
-    headers: {
-      "User-Agent": request.headers.get("User-Agent") ?? "Mozilla/5.0",
-      "Accept": "application/json",
-    },
-  });
+  // 上游请求超时控制：10 秒内未响应则快速失败
+  const upstreamController = new AbortController();
+  const upstreamTimeout = setTimeout(() => upstreamController.abort(), 10_000);
+  let upstream: Response;
+  try {
+    upstream = await fetch(apiUrl.toString(), {
+      headers: {
+        "User-Agent": request.headers.get("User-Agent") ?? "Mozilla/5.0",
+        "Accept": "application/json",
+      },
+      signal: upstreamController.signal,
+    });
+  } finally {
+    clearTimeout(upstreamTimeout);
+  }
 
   const responseText = await upstream.text();
   const headers = createCorsHeaders(upstream.headers);
@@ -145,6 +154,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   // 判断是否应该缓存：必须是 200 状态，且内容不能是空数组或包含错误标识，且未指定强制刷新
   const isSearch = url.searchParams.get("types") === "search";
+  const isUrlType = url.searchParams.get("types") === "url";
   const isEmptyResult = responseText.trim() === "[]";
   const isError = responseText.includes('"error"') || responseText.includes('"status":0');
   
@@ -153,6 +163,15 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   // 如果是搜索请求且结果为空，通常是 API 繁忙或异常，不建议长缓存
   if (isSearch && isEmptyResult) {
     shouldCache = false;
+  }
+  
+  // 音频直链 URL 请求：空 URL 或极短响应不缓存，防止缓存毒化
+  if (isUrlType) {
+    const hasValidUrl = /"url"\s*:\s*"https?:\/\/[^"]{5,}"/.test(responseText);
+    const responseTooShort = responseText.length < 50;
+    if (!hasValidUrl || responseTooShort) {
+      shouldCache = false;
+    }
   }
 
   if (shouldCache) {
@@ -194,5 +213,21 @@ export async function onRequest({ request, waitUntil, env }: { request: Request,
     return proxyKuwoAudio(target, request);
   }
 
-  return proxyApiRequest(url, request, waitUntil, apiBaseUrl);
+  try {
+    return await proxyApiRequest(url, request, waitUntil, apiBaseUrl);
+  } catch (err: any) {
+    console.error(`[Proxy ERROR] ${err?.message || err}`);
+    return new Response(err?.message === "AbortError" || err?.name === "AbortError"
+      ? JSON.stringify({ error: "Upstream request timeout" })
+      : JSON.stringify({ error: "Proxy request failed" }),
+      {
+        status: 502,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "no-store",
+        },
+      }
+    );
+  }
 }

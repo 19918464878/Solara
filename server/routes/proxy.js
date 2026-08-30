@@ -121,12 +121,16 @@ async function proxyApiRequest(reqUrl, req, res) {
     });
 
     try {
+      const wranglerController = new AbortController();
+      const wranglerTimeout = setTimeout(() => wranglerController.abort(), 10_000);
       upstream = await fetch(wranglerUrl.toString(), {
         headers: {
           'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
           'Accept': 'application/json',
         },
+        signal: wranglerController.signal,
       });
+      clearTimeout(wranglerTimeout);
       responseText = await upstream.text();
       contentType = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
     } catch (err) {
@@ -146,12 +150,16 @@ async function proxyApiRequest(reqUrl, req, res) {
     }
 
     try {
+      const upstreamController = new AbortController();
+      const upstreamTimeout = setTimeout(() => upstreamController.abort(), 10_000);
       upstream = await fetch(apiUrl.toString(), {
         headers: {
           'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
           'Accept': 'application/json',
         },
+        signal: upstreamController.signal,
       });
+      clearTimeout(upstreamTimeout);
       responseText = await upstream.text();
       contentType = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
     } catch (err) {
@@ -162,11 +170,17 @@ async function proxyApiRequest(reqUrl, req, res) {
 
   // ── 判断是否缓存（与 Cloudflare 版本逻辑完全一致） ──────────────────────────
   const isSearch = parsedReq.searchParams.get('types') === 'search';
+  const isUrlType = parsedReq.searchParams.get('types') === 'url';
   const isEmptyResult = responseText.trim() === '[]';
   const isError = responseText.includes('"error"') || responseText.includes('"status":0');
 
   let shouldCache = upstream.status === 200 && !isError && !bypassCache;
   if (isSearch && isEmptyResult) shouldCache = false;
+  if (isUrlType) {
+    const hasValidUrl = /"url"\s*:\s*"https?:\/\/[^"]{5,}"/.test(responseText);
+    const responseTooShort = responseText.length < 50;
+    if (!hasValidUrl || responseTooShort) shouldCache = false;
+  }
 
   if (shouldCache) {
     cache.set(cacheKey, { body: responseText, contentType }, 300); // 缓存 5 分钟

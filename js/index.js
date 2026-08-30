@@ -3236,6 +3236,31 @@ if (!("mediaSession" in navigator)) {
     dom.audioPlayer.addEventListener("ended", autoPlayNext);
 }
 
+// 播放中途错误恢复：CDN 过期/断连时自动重试
+(() => {
+    const audio = dom.audioPlayer;
+    if (!audio) return;
+    let recoveryLocked = false;
+    audio.addEventListener('error', () => {
+        if (recoveryLocked) return;
+        if (!audio.src || audio.networkState === 3) return;
+        if (!state.currentSong) return;
+        const savedTime = audio.currentTime || 0;
+        debugLog(`音频播放中途错误 (error code: ${audio.error ? audio.error.code : 'unknown'})，尝试恢复...`);
+        recoveryLocked = true;
+        playSong(state.currentSong, {
+            autoplay: true,
+            startTime: savedTime - 1,  // 回退 1 秒避免卡顿重复
+            preserveProgress: true,
+            retryCount: 0,
+        }).catch(() => {
+            debugLog('错误恢复失败，停止重试');
+        }).finally(() => {
+            recoveryLocked = false;
+        });
+    });
+})();
+
 function setupInteractions() {
     function ensureQualityMenuPortal() {
         if (!dom.playerQualityMenu || !document.body || !isMobileView) {
@@ -5552,26 +5577,34 @@ function waitForAudioReady(player) {
     if (player.readyState >= 1) {
         return Promise.resolve();
     }
+    const AUDIO_READY_TIMEOUT_MS = 12_000;
     return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (fn) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            fn();
+        };
         const cleanup = () => {
+            clearTimeout(timeoutId);
             player.removeEventListener('loadedmetadata', onLoaded);
             player.removeEventListener('error', onError);
+            player.removeEventListener('canplay', onCanPlay);
         };
-        const onLoaded = () => {
-            cleanup();
-            resolve();
-        };
-        const onError = () => {
-            cleanup();
-            reject(new Error('音频加载失败'));
-        };
+        const onLoaded = () => finish(resolve);
+        const onCanPlay = () => finish(resolve);
+        const onError = () => finish(() => reject(new Error('音频加载失败')));
+        const timeoutId = setTimeout(() => finish(() => reject(new Error('音频加载超时'))), AUDIO_READY_TIMEOUT_MS);
         player.addEventListener('loadedmetadata', onLoaded, { once: true });
+        player.addEventListener('canplay', onCanPlay, { once: true });
         player.addEventListener('error', onError, { once: true });
     });
 }
 
 async function playSong(song, options = {}) {
-    const { autoplay = true, startTime = 0, preserveProgress = false, isRetry = false } = options;
+    const { autoplay = true, startTime = 0, preserveProgress = false, retryCount = 0 } = options;
+    const MAX_RETRIES = 2;
 
     window.clearTimeout(pendingPaletteTimer);
     state.audioReadyForPalette = false;
@@ -5583,12 +5616,17 @@ async function playSong(song, options = {}) {
     try {
         updateCurrentSongInfo(song, { loadArtwork: false });
 
-        const quality = state.playbackQuality || '320';
+        // 重试时降低音质以增加成功率
+        const qualityQualities = ['320', '192', '128'];
+        const quality = retryCount < qualityQualities.length 
+            ? qualityQualities[retryCount] 
+            : (state.playbackQuality || '320');
+        
         let audioUrl = API.getSongUrl(song, quality);
-        if (isRetry) {
+        if (retryCount > 0) {
             audioUrl += '&nocache=true';
         }
-        debugLog(`获取音频URL: ${audioUrl}`);
+        debugLog(`获取音频URL (音质${quality}, 尝试${retryCount + 1}/${MAX_RETRIES + 1}): ${audioUrl}`);
 
         const audioData = await API.fetchJson(audioUrl);
 
@@ -5688,15 +5726,18 @@ async function playSong(song, options = {}) {
             if (playPromise !== undefined) {
                 playPromise.catch(async error => {
                     console.error('播放失败:', error);
-                    if (!isRetry) {
-                        debugLog('音频播放遇到错误，尝试刷新缓存重试...');
-                        try {
-                            await playSong(song, { ...options, isRetry: true });
-                        } catch (retryError) {
-                            showNotification('播放失败，请检查网络连接', 'error');
-                        }
+                    if (retryCount < MAX_RETRIES) {
+                        const delayMs = 1000 * (retryCount + 1);
+                        debugLog(`播放失败，${delayMs / 1000}秒后进行第 ${retryCount + 2} 次重试...`);
+                        setTimeout(async () => {
+                            try {
+                                await playSong(song, { ...options, retryCount: retryCount + 1 });
+                            } catch (retryError) {
+                                showNotification('播放失败，请检查网络连接或切换音源', 'error');
+                            }
+                        }, delayMs);
                     } else {
-                        showNotification('播放失败，请检查网络连接', 'error');
+                        showNotification('多次尝试播放失败，请检查网络连接或切换音源', 'error');
                     }
                 });
             } else {
@@ -5716,9 +5757,11 @@ async function playSong(song, options = {}) {
         }
     } catch (error) {
         console.error('播放歌曲失败:', error);
-        if (!isRetry) {
-            debugLog('播放歌曲失败，尝试刷新缓存重试...', error);
-            return playSong(song, { ...options, isRetry: true });
+        if (retryCount < MAX_RETRIES) {
+            const delayMs = 1000 * (retryCount + 1);
+            debugLog(`获取音频失败，${delayMs / 1000}秒后重试...`, error);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+            return playSong(song, { ...options, retryCount: retryCount + 1 });
         }
         throw error;
     } finally {
