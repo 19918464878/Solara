@@ -5602,9 +5602,78 @@ function waitForAudioReady(player) {
     });
 }
 
+// ── 跨源兜底：为取不到播放地址的歌曲在其它音源寻找同名替代 ─────────────
+function normalizeArtists(artist) {
+    if (!artist) return '';
+    return (Array.isArray(artist) ? artist.join('/') : String(artist)).toLowerCase();
+}
+
+function songNameMatchScore(name, query) {
+    const n = String(name || '').toLowerCase();
+    const q = String(query || '').toLowerCase();
+    if (!q) return 0;
+    if (n === q) return 1;
+    if (n.includes(q) || q.includes(n)) return 0.7;
+    const strip = (s) => s.replace(/[\s（）()[\]【】]/g, '').toLowerCase();
+    const ns = strip(n);
+    const qs = strip(q);
+    if (ns === qs) return 0.9;
+    if (ns.includes(qs) || qs.includes(ns)) return 0.6;
+    return 0.3;
+}
+
+function pickFallbackMatch(results, songName, songArtist) {
+    let best = null;
+    let bestScore = 0;
+    const targetArtist = normalizeArtists(songArtist);
+    for (const result of results || []) {
+        if (!result || !result.id) continue;
+        const nameScore = songNameMatchScore(result.name, songName);
+        if (nameScore < 0.5) continue;
+        const artistBonus = targetArtist && normalizeArtists(result.artist).includes(targetArtist) ? 1 : 0;
+        const score = nameScore + artistBonus;
+        if (score > bestScore) {
+            best = result;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+async function findFallbackSong(song, triedSources = []) {
+    if (!song || !song.name) return null;
+    const excluded = new Set(triedSources);
+    excluded.add(song.source || 'netease');
+    for (const source of SOURCE_OPTIONS.map(option => option.value)) {
+        if (excluded.has(source)) continue;
+        try {
+            const artistText = Array.isArray(song.artist) ? song.artist.join(' ') : (song.artist || '');
+            const query = (artistText ? artistText + ' ' : '') + song.name;
+            const results = await API.search(query, source, 5, 1);
+            const match = pickFallbackMatch(results, song.name, song.artist);
+            if (match && match.id) {
+                return {
+                    id: match.id,
+                    name: song.name,
+                    artist: song.artist,
+                    album: match.album || song.album,
+                    pic_id: match.pic_id || song.pic_id,
+                    url_id: match.url_id || match.id,
+                    lyric_id: match.lyric_id || match.id,
+                    source,
+                };
+            }
+        } catch (error) {
+            debugLog(`[跨源兜底] 尝试 ${source} 源失败: ${error && error.message}`);
+        }
+    }
+    return null;
+}
+
 async function playSong(song, options = {}) {
-    const { autoplay = true, startTime = 0, preserveProgress = false, retryCount = 0 } = options;
+    const { autoplay = true, startTime = 0, preserveProgress = false, retryCount = 0, attemptedFallbackSources = [] } = options;
     const MAX_RETRIES = 2;
+    let sourceFallbackUsed = false;
 
     window.clearTimeout(pendingPaletteTimer);
     state.audioReadyForPalette = false;
@@ -5616,22 +5685,37 @@ async function playSong(song, options = {}) {
     try {
         updateCurrentSongInfo(song, { loadArtwork: false });
 
-        // 重试时降低音质以增加成功率
-        const qualityQualities = ['320', '192', '128'];
-        const quality = retryCount < qualityQualities.length 
-            ? qualityQualities[retryCount] 
-            : (state.playbackQuality || '320');
-        
+        // 首次播放使用用户选择的音质，重试时逐级降质以增加成功率
+        const qualityLadder = [state.playbackQuality || '320', '192', '128'];
+        const quality = qualityLadder[Math.min(retryCount, qualityLadder.length - 1)];
+
         let audioUrl = API.getSongUrl(song, quality);
         if (retryCount > 0) {
             audioUrl += '&nocache=true';
         }
         debugLog(`获取音频URL (音质${quality}, 尝试${retryCount + 1}/${MAX_RETRIES + 1}): ${audioUrl}`);
 
-        const audioData = await API.fetchJson(audioUrl);
+        let audioData = await API.fetchJson(audioUrl);
+
+        // ── 跨源兜底：原音源取不到播放地址时，自动用其它音源顶替 ──
+        if (!audioData || !audioData.url) {
+            const fallback = await findFallbackSong(song, attemptedFallbackSources);
+            if (fallback) {
+                debugLog(`[跨源兜底] ${song.source || '未知源'} 无法播放，改用 ${fallback.source} 的《${fallback.name}》`);
+                song = fallback;
+                attemptedFallbackSources.push(fallback.source);
+                audioUrl = API.getSongUrl(song, quality) + '&nocache=true';
+                audioData = await API.fetchJson(audioUrl);
+                sourceFallbackUsed = true;
+            }
+        }
 
         if (!audioData || !audioData.url) {
             throw new Error('无法获取音频播放地址');
+        }
+
+        if (sourceFallbackUsed) {
+            showNotification('原音源暂无播放地址，已自动切换至其它音源', 'warning');
         }
 
         const originalAudioUrl = audioData.url;
